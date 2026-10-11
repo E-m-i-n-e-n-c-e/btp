@@ -28,7 +28,7 @@ dev = [
 publisher = "sentinels"
 
 [tool.hatch.build.targets.wheel]
-packages = ["app", "core", "federation", "data", "training", "telemetry"]
+packages = ["app", "core", "federation", "data", "training", "telemetry", "attacks"]
 
 [tool.flwr.app.components]
 serverapp = "app.server_app:app"

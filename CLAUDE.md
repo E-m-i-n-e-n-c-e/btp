@@ -51,7 +51,7 @@ Flower 1.37 quirks that `scripts/run_simulation.sh` handles:
 `TRACEStrategy` (implements Flower's `Strategy` interface) drives each round:
 - `configure_fit` — samples clients via `federation/client_selector.py::RandomClientSelector`, tracks downlink bytes, sends current global `Parameters`.
 - `fit` happens client-side (see below); results come back as `(ClientProxy, FitRes)` pairs.
-- `aggregate_fit` — logs each client's reported loss/accuracy explicitly via `logger.info` (this bypasses Ray's log deduplication, which otherwise hides per-actor logs), tracks uplink bytes, validates each update with `federation/update_validator.py::UpdateValidator` (checks example count > 0, correct parameter shapes, finite values), then aggregates valid updates with `federation/strategy.py::FedAvgStrategy` (num-examples-weighted average).
+- `aggregate_fit` — logs each client's reported loss/accuracy explicitly via `logger.info` (this bypasses Ray's log deduplication, which otherwise hides per-actor logs), tracks uplink bytes, validates each update with `federation/update_validator.py::UpdateValidator` (example count > 0, float32, finite, correct shapes, plus optional `max_num_examples` / `max_update_norm` caps), logs per-client update signals, then aggregates valid updates with the configured aggregator (default FedAvg, num-examples-weighted).
 - `configure_evaluate` — intentionally returns `[]`; **federated (client-side) evaluation is disabled**. Do not "fix" this without checking intent — the design evaluates the global model centrally instead (see below).
 - `evaluate` — server evaluates the aggregated global model centrally against the **full** MNIST test set (`FederatedDatasetProvider.get_global_test_loader()`), not against per-client local splits. This is deliberate: it gives an unbiased accuracy signal independent of any client's local data. Emits one structured `round_complete` JSON log line via `telemetry/logging.py::log_round`.
 
@@ -82,6 +82,8 @@ Per-round bookkeeping (selected/successful/failed clients, timings, global loss/
 
 ### Extension points implied by the architecture
 
-- `federation/strategy.py::AggregationStrategy` is an abstract interface with `FedAvgStrategy` as the only implementation; Krum/Median/Trimmed-Mean (per the Phase 1 plan) would be added here.
+- `federation/strategy.py::AggregationStrategy` has `FedAvgStrategy`, `MedianStrategy`, `TrimmedMeanStrategy`, selected by `federation.aggregation` via `build_aggregation_strategy`; Krum (Member 4) would be added to the `AGGREGATORS` registry.
 - `federation/client_selector.py::ClientSelector` is similarly an abstract interface with only `RandomClientSelector` implemented.
-- No attack engine or detection (CKA/cosine/norm) module exists yet in the current tree, despite being part of the Phase 1 plan — `core/model.py`'s `get_penultimate_layer` exists specifically to support future CKA-based analysis.
+- `attacks/` is the attack engine (label flipping, Gaussian noise, sign flip, scaling), attached to `TRACEClient.fit` via two hooks: `apply_pre_training` (wraps the DataLoader) and `apply_post_training` (rewrites the update). Configured by the `attack:` block; see `trace-fl/docs/ATTACKS.md`.
+- `federation/update_stats.py::compute_update_stats` (update norm, cosine to the leave-one-out median of peers) is logged per client as a `client_update` event. It is measurement only; CKA is not implemented yet (`core/model.py::get_penultimate_layer` exists for it). The client-reported `is_attacked` flag is ground truth for analysis and must never be read by a defense.
+- `scripts/plot_attack_benchmark.py` runs attack sweeps in-process through the same components (no Flower/Ray) and writes `artifacts/benchmarks/*.png`; `--demo <attack>` is a ~1 min live check.

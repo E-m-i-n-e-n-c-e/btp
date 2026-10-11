@@ -21,8 +21,8 @@ COPY pyproject.toml uv.lock .python-version ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --extra dev --no-install-project
 
-# Bake MNIST into the image so simulated clients never race to download it at runtime.
-RUN python -c "from torchvision import datasets; [datasets.MNIST('/app/data', train=t, download=True) for t in (True, False)]"
+# Bake MNIST and Fashion-MNIST into the image so simulated clients never race to download it at runtime.
+RUN python -c "from torchvision import datasets; [d('/app/data', train=t, download=True) for d in (datasets.MNIST, datasets.FashionMNIST) for t in (True, False)]"
 
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \

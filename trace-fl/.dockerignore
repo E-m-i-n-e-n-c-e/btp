@@ -7,5 +7,6 @@
 experiments/
 *.log
 data/MNIST/
+data/FashionMNIST/
 .git/
 .DS_Store

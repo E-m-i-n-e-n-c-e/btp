@@ -13,9 +13,9 @@ uv sync
 ```
 
 ### Run the Simulation
-To execute a local federated learning simulation (by default, managing 12 Ray actors/clients), use the following command:
+To execute a local federated learning simulation (`num_clients` from `config/config.yaml`), use the following command:
 ```bash
-uv run flwr run . --stream
+uv run sh scripts/run_simulation.sh   # sets the SuperNode count to num_clients first
 ```
 *Note: The `--stream` flag ensures real-time telemetry logs are output directly to your terminal.*
 
@@ -65,6 +65,4 @@ A core requirement of Federated Learning is that clients only train on their own
 In `data/dataset.py`, the `FederatedDatasetProvider` uses a fixed random seed (`torch.Generator().manual_seed(seed)`) in conjunction with PyTorch's `random_split`. Because the seed is fixed, the split is perfectly deterministic across all client processes.
 
 ### Resolving the `partition_id`
-When the Simulation engine (Ray) spins up multiple clients in parallel, each client needs to know which partition it owns. In `app/client_app.py`, a file-based lock (`fcntl.flock`) is used on a temporary counter file (`/tmp/flwr_client_counter.txt`). 
-This guarantees that as clients boot up simultaneously, they are assigned a strictly sequential `partition_id` (0, 1, 2...). 
-Client 0 will load `self.train_partitions[0]`, Client 1 will load `self.train_partitions[1]`, ensuring mutually exclusive datasets.
+Flower's simulation gives every virtual SuperNode a `partition-id` (0..N-1) in `context.node_config`; in deployment mode `run.py` passes it with `--node-config "partition-id=i num-partitions=N"`. `client_fn` reads it and refuses to start without it (`context.node_id` is a random 64-bit integer, so `node_id % N` could hand two clients the same partition). Client `i` therefore loads `train_partitions[i]`, and partitions are mutually exclusive.

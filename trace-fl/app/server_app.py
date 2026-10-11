@@ -2,7 +2,7 @@ from core.config import load_config
 import time
 import torch
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from flwr.common import (
     EvaluateIns,
@@ -21,12 +21,13 @@ from flwr.server import ServerApp, ServerConfig, ServerAppComponents
 from flwr.common import Context
 
 from core.model import create_model, get_parameters, set_parameters
-from federation.strategy import FedAvgStrategy
+from federation.strategy import build_aggregation_strategy
 from federation.client_selector import RandomClientSelector
 from federation.update_validator import UpdateValidator
+from federation.update_stats import compute_update_stats
 from federation.round_state import RoundState
 from telemetry.communication import CommunicationTracker
-from telemetry.logging import log_round, logger
+from telemetry.logging import log_client_update, log_round, logger
 from training.trainer import evaluate as evaluate_model
 from data.dataset import FederatedDatasetProvider
 
@@ -34,7 +35,8 @@ from data.dataset import FederatedDatasetProvider
 class TRACEStrategy(Strategy):
     def __init__(self, config: dict):
         self.config = config
-        self.aggregation_strategy = FedAvgStrategy()
+        federation_cfg = self.config.get("federation", {})
+        self.aggregation_strategy = build_aggregation_strategy(federation_cfg)
 
         # In simulation, clients are sequential indices.
         seed = self.config.get("seed", 42)
@@ -50,8 +52,12 @@ class TRACEStrategy(Strategy):
         expected_shapes = [p.shape for p in initial_params]
 
         self.update_validator = UpdateValidator(
-            expected_shapes=expected_shapes
+            expected_shapes=expected_shapes,
+            max_num_examples=federation_cfg.get("max_num_examples"),
+            max_update_norm=federation_cfg.get("max_update_norm"),
         )
+        # Global weights sent out this round; reference point for update deltas.
+        self.current_global: Optional[List] = None
 
         self.round_state = RoundState()
         self.tracker = CommunicationTracker()
@@ -90,6 +96,7 @@ class TRACEStrategy(Strategy):
         )
 
         self.test_loader = self.dataset_provider.get_global_test_loader()
+        self.eval_history: List[Dict[str, Any]] = []
 
     def initialize_parameters(
         self,
@@ -141,6 +148,7 @@ class TRACEStrategy(Strategy):
 
         # Track downlink communication.
         ndarrays = parameters_to_ndarrays(parameters)
+        self.current_global = ndarrays
 
         for cid in selected_cids:
             self.tracker.record_downlink(
@@ -178,6 +186,7 @@ class TRACEStrategy(Strategy):
         agg_start_time = time.time()
 
         valid_updates = []
+        received = []  # (cid_str, fit_res, ndarrays, is_valid, reason)
 
         for client, fit_res in results:
             ndarrays = parameters_to_ndarrays(
@@ -187,10 +196,11 @@ class TRACEStrategy(Strategy):
             # Log client's local metrics.
             metrics = fit_res.metrics
 
-            cid_str = metrics.get(
+            # Self-reported, human-readable ID (Ray's client.cid is an opaque int).
+            cid_str = str(metrics.get(
                 "client_id",
                 client.cid,
-            )
+            ))
 
             logger.info(
                 f"Client {cid_str} local training complete -> "
@@ -201,16 +211,17 @@ class TRACEStrategy(Strategy):
             # Track uplink.
             self.tracker.record_uplink(
                 server_round,
-                client.cid,
+                cid_str,
                 ndarrays,
             )
 
             # Validate update.
-            is_valid = self.update_validator.validate(
-                client_id=client.cid,
+            is_valid, reason = self.update_validator.check(
                 num_examples=fit_res.num_examples,
                 parameters=ndarrays,
+                global_parameters=self.current_global,
             )
+            received.append((cid_str, fit_res, ndarrays, is_valid, reason))
 
             if is_valid:
                 valid_updates.append(
@@ -220,14 +231,13 @@ class TRACEStrategy(Strategy):
                     )
                 )
 
-                self.round_state.successful_clients.append(
-                    client.cid
-                )
+                self.round_state.successful_clients.append(cid_str)
 
             else:
-                self.round_state.failed_clients.append(
-                    client.cid
-                )
+                logger.warning(f"Rejected update from {cid_str}: {reason}")
+                self.round_state.failed_clients.append(cid_str)
+
+        self._log_update_signals(server_round, received)
 
         if not valid_updates:
             return None, {}
@@ -245,6 +255,26 @@ class TRACEStrategy(Strategy):
             ndarrays_to_parameters(aggregated_ndarrays),
             {},
         )
+
+    def _log_update_signals(self, server_round: int, received: list) -> None:
+        """Emit one client_update event per received update (norm + cosine)."""
+        if self.current_global is None:
+            return
+        # Only finite, correctly shaped updates can be compared numerically.
+        comparable = [r for r in received if r[3] or r[4] in (
+            "num_examples_above_cap", "update_norm_above_bound")]
+        stats = compute_update_stats(self.current_global, [r[2] for r in comparable])
+        for (cid_str, fit_res, _, is_valid, reason), st in zip(comparable, stats):
+            log_client_update(
+                round_num=server_round,
+                client_id=cid_str,
+                num_examples=fit_res.num_examples,
+                accepted=is_valid,
+                rejection_reason=reason,
+                is_attacked=bool(fit_res.metrics.get("is_attacked", False)),
+                update_norm=st["update_norm"],
+                cosine_to_peers=st["cosine_to_peers"],
+            )
 
     def configure_evaluate(
         self,
@@ -323,14 +353,45 @@ class TRACEStrategy(Strategy):
             ndarrays,
         )
 
-        loss, accuracy = evaluate_model(
+        loss, accuracy, detailed = evaluate_model(
             self.global_model,
             self.test_loader,
             self.device,
+            return_details=True,
         )
+
+        macro_f1 = float(detailed.get("macro_f1", 0.0))
+        roc_auc_macro = float(detailed.get("roc_auc", {}).get("macro_auc", 0.0))
 
         self.round_state.global_loss = loss
         self.round_state.global_accuracy = accuracy
+
+        # Record evaluation stats for this round
+        eval_record = {
+            "round": server_round,
+            "global_loss": loss,
+            "global_accuracy": accuracy,
+            "macro_f1": macro_f1,
+            "weighted_f1": float(detailed.get("weighted_f1", 0.0)),
+            "class_f1": detailed.get("class_f1", {}),
+            "class_precision": detailed.get("class_precision", {}),
+            "class_recall": detailed.get("class_recall", {}),
+            "roc_auc": detailed.get("roc_auc", {}),
+            "confusion_matrix": detailed.get("confusion_matrix", []),
+            "roc_curves": detailed.get("roc_curves", {}),
+        }
+        self.eval_history.append(eval_record)
+
+        # Write latest evaluation history to JSON
+        try:
+            import json
+            from pathlib import Path
+            eval_dir = Path("artifacts/eval_results")
+            eval_dir.mkdir(parents=True, exist_ok=True)
+            with open(eval_dir / "eval_metrics.json", "w") as f:
+                json.dump(self.eval_history, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not persist eval_metrics.json: {e}")
 
         if server_round == 0:
             self.round_state.round_duration = 0.0
@@ -343,7 +404,7 @@ class TRACEStrategy(Strategy):
             server_round
         )
 
-        # Log round telemetry.
+        # Log round telemetry with F1 and ROC AUC
         log_round(
             round_num=server_round,
             selected_clients=self.round_state.selected_clients,
@@ -355,11 +416,16 @@ class TRACEStrategy(Strategy):
             downlink_bytes=round_totals["downlink_bytes"],
             aggregation_time=self.round_state.aggregation_time,
             round_time=self.round_state.round_duration,
+            macro_f1=macro_f1,
+            roc_auc=roc_auc_macro,
         )
 
         return loss, {
-            "accuracy": accuracy
+            "accuracy": accuracy,
+            "macro_f1": macro_f1,
+            "roc_auc": roc_auc_macro,
         }
+
 
 
 def server_fn(context: Context) -> ServerAppComponents:

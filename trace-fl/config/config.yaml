@@ -1,6 +1,10 @@
 num_clients: 5
 num_rounds: 3
 
+# Dataset and partitioning configuration (see DatasetSplit_Documentation.pdf)
+#   name: mnist | fashion_mnist
+#   partition_type: iid | dirichlet
+#   alpha: 1.0 (mild skew) | 0.5 (moderate skew) | 0.1 (strong skew)
 dataset:
   name: fashion_mnist
   partition_type: dirichlet
@@ -14,5 +18,38 @@ local_training:
 federation:
   fraction_train: 1.0
   min_available_clients: 2
+  # Aggregation rule: fedavg | median | trimmed_mean (trim_ratio per side)
+  aggregation: fedavg
+  trim_ratio: 0.1
+  # Optional server-side hardening (null = off, so attacks stay observable):
+  #   max_update_norm: reject updates with ||w_client - w_global|| above this
+  #   max_num_examples: reject updates claiming more samples than this
+  max_update_norm: null
+  max_num_examples: null
 
 seed: 42
+
+# Attack Engine configuration (Member 3) -- see README "Attack Engine" section
+#   type: label_flipping | gaussian_noise | sign_flip | scaling
+#   intensity, by type:
+#     label_flipping  fraction of local labels flipped (0..1)
+#     gaussian_noise  noise sigma as a multiple of the update's per-coordinate RMS
+#     sign_flip       gamma: sends -gamma * delta
+#     scaling         beta: sends beta * delta (1.0 = no-op; use e.g. 10)
+#   schedule.mode: continuous | intermittent | custom_rounds | probabilistic
+#   targets.mode: client_ids (list) | fraction (first round(N*fraction) clients)
+#   params (label_flipping): mode permutation | targeted | offset,
+#                            source_class / target_class for targeted
+attack:
+  enabled: false
+  type: sign_flip
+  intensity: 1.0
+  schedule:
+    mode: intermittent
+    start_round: 2
+    end_round: 20
+    interval: 2
+  targets:
+    mode: client_ids
+    client_ids: [0]
+

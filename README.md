@@ -326,6 +326,96 @@ AttackEngine
 
 that can be attached to any client.
 
+## 8.1 Status: implemented, with measured results
+
+Full write-up (architecture, threat model, the math of each attack, every
+command, all results, vulnerabilities): **[`trace-fl/docs/ATTACKS.md`](trace-fl/docs/ATTACKS.md)**.
+
+### Where the attacks plug in
+
+```text
+client fit():  w_global ─► [HOOK 1: data poisoning]  ─► local SGD ─► [HOOK 2: model poisoning] ─► send
+                           label_flipping wraps the        Δ = w_local − w_global is rewritten:
+                           DataLoader (y -> 9-y,           gaussian  Δ + N(0, σ²)
+                           or 7 -> 1 targeted)             sign_flip −γΔ
+                                                           scaling    βΔ
+server:  validate (float32, finite, shapes, [opt] norm bound, [opt] num_examples cap)
+         ─► log norm + cosine-to-peers per client ─► fedavg | median | trimmed_mean ─► evaluate on 10k test set
+```
+
+Honest and malicious clients run the same code; `AttackEngine.from_config`
+is a no-op unless `attack.enabled: true`, and only targeted clients attack.
+
+### Accuracy drop per attack
+
+MNIST, 10 clients, **2 malicious (20%)**, FedAvg, 10 rounds, seed 42.
+
+| Attack | Intensity | What the attacker sends | Final accuracy | Drop |
+|---|---|---|---|---|
+| None | — | honest update | **96.78%** | — |
+| Label flipping | 100% of labels | gradient of the wrong labels | 96.52% | −0.3 pp |
+| Gaussian noise | σ = 300 × update RMS | Δ + noise | **12.86%** | −83.9 pp |
+| Sign flip | γ = 4 | −4Δ | **10.30%** | −86.5 pp |
+| Scaling | β = 10 | 10Δ | **28.08%** | −68.7 pp |
+
+![Accuracy per round under each attack](trace-fl/artifacts/benchmarks/attack_accuracy_vs_round.png)
+
+![Final accuracy vs share of malicious clients](trace-fl/artifacts/benchmarks/attack_fraction_sweep.png)
+
+![Final accuracy vs attack intensity](trace-fl/artifacts/benchmarks/attack_intensity_sweep.png)
+
+Key findings:
+
+1. **Sign flip has a closed-form breaking point.** FedAvg's step is
+   `(1 − f(1+γ))·Δ̄`, so training stalls at γ* = (1 − f)/f = 4 for f = 0.2.
+   Measured: γ = 2 gives 93.5%, γ = 4 gives 10.3%, and γ = 8 gives 1.2% (below chance).
+2. **Gaussian noise is a cliff.** It is harmless up to 100× the update size
+   (random noise in 421k dimensions averages out) and destructive at 300×.
+3. **Label flipping is weak against FedAvg** until attackers reach 50% of
+   clients (47.5%; 46% of test digits are then predicted as 9 − y). Its
+   *targeted* form hides inside global accuracy: 7 → 1 flipping costs only
+   0.55 pp globally but drops class-7 recall from 95.7% to 88.1%.
+4. **Scaling is invisible to cosine** (same direction as honest clients) and
+   visible only by norm. Sign flip is the opposite. A detector needs both signals.
+
+### Do malicious updates look different?
+
+![Per-client update norm vs cosine to peers](trace-fl/artifacts/benchmarks/attack_update_signatures.png)
+
+Under IID every attack separates cleanly. Under Dirichlet α = 0.5 (bottom
+row) the honest clients spread out, and label flipping's margin narrows. This is the
+Phase 1 question for CKA (Section 13).
+
+### Baseline defenses
+
+![Final accuracy by aggregation rule](trace-fl/artifacts/benchmarks/attack_defense_matrix.png)
+
+Median and trimmed mean recover every attack (≥ 96.4%). A static norm bound
+recovers noise and scaling but **only partly recovers sign flip (87.3%)**:
+honest update norms shrink from 1.59 to 0.23 over training, so from round 3
+the attacker fits under the fixed bound.
+
+### Commands
+
+```bash
+cd trace-fl
+
+# ~1 minute: one attack vs no attack, prints accuracy per round + update signature
+uv run python scripts/plot_attack_benchmark.py --demo sign_flip      # or label_flipping | gaussian_noise | scaling
+
+# Real Flower runtime in Docker (config/config.yaml is not modified)
+python run.py sim --dataset mnist --partition iid --clients 10 --rounds 10 \
+  --attack-type sign_flip --attack-intensity 4 --attack-mode continuous --attack-start 1 --attack-clients 0,1
+python run.py sim ... --aggregation median          # same attack, robust aggregation
+
+# Regenerate every graph above (62 experiments; uses CUDA if available)
+uv run python scripts/plot_attack_benchmark.py --rerun
+```
+
+The server logs one `client_update` JSON event per client per round
+(`update_norm`, `cosine_to_peers`, `accepted`, `is_attacked`), and attackers
+log `attack_injected`.
+
 ---
 
 # 9. Member 4 — Detection Baseline

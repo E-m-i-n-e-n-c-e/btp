@@ -1,15 +1,16 @@
-import yaml
 import torch
 import time
 
 from flwr.client import NumPyClient, ClientApp
 from flwr.common import Context
 
+from core.config import load_config
 from core.model import create_model, set_parameters, get_parameters
 from data.dataset import FederatedDatasetProvider
 from training.trainer import train, evaluate
 from telemetry.communication import CommunicationTracker
-from telemetry.logging import log_client, log_client_evaluate
+from telemetry.logging import log_client, log_client_evaluate, log_attack
+from attacks.engine import AttackEngine
 
 
 class TRACEClient(NumPyClient):
@@ -49,6 +50,7 @@ class TRACEClient(NumPyClient):
         )
 
         self.tracker = CommunicationTracker()
+        self.attack_engine = AttackEngine.from_config(self.config)
 
     def get_parameters(self, config):
         return get_parameters(self.model)
@@ -67,6 +69,14 @@ class TRACEClient(NumPyClient):
         # Update model with global parameters
         set_parameters(self.model, parameters)
 
+        # Apply pre-training attack (e.g. Label Flipping data poisoning)
+        train_loader, attack_applied_pre = self.attack_engine.apply_pre_training(
+            train_loader=self.partition.train_loader,
+            round_num=round_num,
+            client_id=self.client_id,
+            num_clients=self.config.get("num_clients", 20),
+        )
+
         # Local training configuration
         epochs = self.config.get("local_training", {}).get("epochs", 1)
         learning_rate = self.config.get(
@@ -76,20 +86,29 @@ class TRACEClient(NumPyClient):
         # Train locally
         metrics = train(
             model=self.model,
-            train_loader=self.partition.train_loader,
+            train_loader=train_loader,
             epochs=epochs,
             learning_rate=learning_rate,
             device=self.device,
         )
 
         # Get updated parameters
-        updated_parameters = get_parameters(self.model)
+        raw_local_parameters = get_parameters(self.model)
 
-        # Track uplink
+        # Apply post-training attack (e.g. Gaussian Noise, Sign Flip, Scaling)
+        final_parameters, attack_applied_post, attack_telemetry = self.attack_engine.apply_post_training(
+            global_parameters=parameters,
+            local_parameters=raw_local_parameters,
+            round_num=round_num,
+            client_id=self.client_id,
+            num_clients=self.config.get("num_clients", 20),
+        )
+
+        # Track uplink with final transmitted parameters
         uplink_bytes = self.tracker.record_uplink(
             round_num,
             self.client_id,
-            updated_parameters,
+            final_parameters,
         )
 
         training_time = time.time() - start_time
@@ -107,13 +126,30 @@ class TRACEClient(NumPyClient):
             downlink_bytes=downlink_bytes,
         )
 
+        # If attack was applied, log attack telemetry event
+        if attack_applied_pre:
+            log_attack(
+                client_id=self.client_id,
+                round_num=round_num,
+                attack_type=self.attack_engine.attack.name if self.attack_engine.attack else "data_poisoning",
+                metrics={"mode": getattr(self.attack_engine.attack, "mode", "label_flipping")},
+            )
+        elif attack_applied_post:
+            log_attack(
+                client_id=self.client_id,
+                round_num=round_num,
+                attack_type=self.attack_engine.attack.name if self.attack_engine.attack else "model_poisoning",
+                metrics=attack_telemetry,
+            )
+
         return (
-            updated_parameters,
+            final_parameters,
             self.partition.num_examples,
             {
                 "loss": float(metrics["loss"]),
                 "accuracy": float(metrics["accuracy"]),
                 "client_id": self.client_id,
+                "is_attacked": attack_applied_pre or attack_applied_post,
             },
         )
 
@@ -147,25 +183,19 @@ class TRACEClient(NumPyClient):
 def client_fn(context: Context):
     """Flower ClientApp entry point."""
 
-    # ----------------------------------------------------------------------
-    # Load configuration
-    # ----------------------------------------------------------------------
-    with open("config/config.yaml", "r") as f:
-        config = yaml.safe_load(f)
+    # Resolved relative to the code, not the CWD (which differs between
+    # simulation and deployment containers).
+    config = load_config()
 
-    # ----------------------------------------------------------------------
-    # Partition ID
-    #
-    # Prefer an explicitly provided partition-id from Flower.
-    # The fallback uses the Windows-compatible process ID instead of fcntl.
-    # ----------------------------------------------------------------------
-    if "partition-id" in context.node_config:
-        partition_id = int(context.node_config["partition-id"])
-    else:
-        partition_id = (
-            int(context.node_id)
-            % config.get("num_clients", 20)
+    # Flower simulation provides partition-id (0..N-1); deployment passes it via
+    # --node-config. context.node_id is a random 64-bit int, so `node_id % N`
+    # would silently give two clients the same partition -> fail loudly instead.
+    if "partition-id" not in context.node_config:
+        raise RuntimeError(
+            "node_config has no 'partition-id'. In deployment mode start the "
+            "SuperNode with --node-config \"partition-id=<i> num-partitions=<N>\"."
         )
+    partition_id = int(context.node_config["partition-id"])
 
     client_id = f"client_{partition_id}"
 

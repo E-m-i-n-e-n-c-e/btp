@@ -25,23 +25,28 @@ TRACE-FL (Docker)
   q) Quit
 ```
 
-- **Run simulation** shows the default settings from `config/config.yaml` (clients, rounds, epochs, batch size, learning rate, seed) and lets you change any of them **for that run only**. It then asks whether to use deployment mode (default: no).
+- **Run simulation** shows the default settings from `config/config.yaml` (clients, rounds, dataset name, partition type, Dirichlet alpha, epochs, batch size, learning rate, seed) and lets you change any of them **for that run only**. It then asks whether to use deployment mode (default: no).
   - `config/config.yaml` is left unchanged. After the run you're asked whether to save the changes as the new defaults (default: no).
   - Every run records the exact config it used in `experiments/<timestamp>/config.yaml` (git-ignored).
-- Every option rebuilds the image first if the code or dependencies changed. The first build downloads PyTorch and MNIST and takes a few minutes; later runs start in seconds.
+- Every option rebuilds the image first if the code or dependencies changed. The first build downloads PyTorch, MNIST, and Fashion-MNIST and takes a few minutes; later runs start in seconds.
 
-`run.py` uses only Python's standard library. It also accepts direct commands:
+`run.py` uses only Python's standard library. It also accepts direct commands with optional split/training flags:
 
 | Task | `run.py` | Plain Docker (no Python on host) |
 |---|---|---|
-| Run the simulation | `python run.py sim` | `docker compose run --rm --build trace-fl` |
+| Run simulation (defaults) | `python run.py sim` | `docker compose run --rm --build trace-fl` |
+| Run with custom split | `python run.py sim --dataset mnist --partition iid` | (edit `config/config.yaml` then run compose) |
+| Run with Dirichlet Non-IID | `python run.py sim --dataset fashion_mnist --partition dirichlet --alpha 0.1` | (edit `config/config.yaml` then run compose) |
 | Run in deployment mode | `python run.py deploy` | (requires `run.py`, which generates the compose file) |
 | Run all tests | `python run.py test` | `docker compose run --rm --build trace-fl pytest` |
 | Run one test file | `python run.py test tests/test_model.py` | `docker compose run --rm --build trace-fl pytest tests/test_model.py` |
 | Shell inside the container | `python run.py shell` | `docker compose run --rm --build trace-fl bash` |
 | Rebuild from scratch | `python run.py rebuild` | `docker compose build --no-cache` |
 
-To change the defaults permanently, edit `config/config.yaml`. `config/` is mounted into the container, so edits take effect without a rebuild.
+To change the defaults permanently, edit `config/config.yaml`. `config/` is mounted into the container, so edits take effect without a rebuild. Supported dataset splits (see `DatasetSplit_Documentation.pdf`):
+- `dataset.name`: `mnist` or `fashion_mnist`
+- `dataset.partition_type`: `iid` or `dirichlet`
+- `dataset.alpha`: `1.0` (mild skew), `0.5` (moderate skew), `0.1` (strong skew)
 
 ## Simulation mode
 
